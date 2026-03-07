@@ -16,15 +16,48 @@
 #
 import numpy as np
 import torch
+from contextlib import contextmanager
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.worker.gpu.sample.gumbel import apply_temperature
 from vllm.v1.worker.gpu.sample.min_p import apply_min_p
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 
 from vllm_ascend.worker.v2.sample.gumbel import gumbel_sample
+from vllm_ascend.worker.v2.sample.logprob import compute_token_logprobs as ascend_compute_token_logprobs
+
+@contextmanager
+def update_compute_token_logprobs():
+    from vllm.v1.worker.gpu.sample import logprob
+    original_compute_token_logprobs = logprob.compute_token_logprobs
+    try:
+        logprob.compute_token_logprobs = ascend_compute_token_logprobs
+        yield
+    finally:
+        logprob.compute_token_logprobs = original_compute_token_logprobs
 
 
 class AscendSampler(Sampler):
+    def __call__(
+        self,
+        logits: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        idx_mapping_np: np.ndarray,
+        cu_num_logits_np: np.ndarray,
+        pos: torch.Tensor,
+        input_ids: torch.Tensor,
+        expanded_local_pos: torch.Tensor,
+    ):
+        with update_compute_token_logprobs():
+            return super().__call__(
+                logits,
+                idx_mapping,
+                idx_mapping_np,
+                cu_num_logits_np,
+                pos,
+                input_ids,
+                expanded_local_pos,
+            )
+
     def sample(
         self,
         logits: torch.Tensor,
