@@ -1,5 +1,8 @@
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, NamedTuple, TypeVar
+from vllm.triton_utils import HAS_TRITON
+if HAS_TRITON:
+    from vllm.model_executor.layers.batch_invariant import vllm_is_batch_invariant
 
 import numpy as np
 import torch
@@ -91,6 +94,10 @@ class AscendMLABackend(AttentionBackend):
             from vllm_ascend.attention.context_parallel.mla_cp import AscendMlaCPImpl
 
             return AscendMlaCPImpl
+        if vllm_is_batch_invariant() and HAS_TRITON:
+            from vllm_ascend.attention.batch_invariant.mla_v1 import TritonMLAImpl
+
+            return TritonMLAImpl
         return AscendMLAImpl
 
     @staticmethod
