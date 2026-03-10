@@ -23,17 +23,17 @@ from vllm.v1.worker.gpu.sample.min_p import apply_min_p
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 
 from vllm_ascend.worker.v2.sample.gumbel import gumbel_sample
-from vllm_ascend.worker.v2.sample.logprob import compute_token_logprobs as ascend_compute_token_logprobs
+from vllm_ascend.worker.v2.sample.logprob import compute_topk_logprobs as ascend_compute_topk_logprobs
 
 @contextmanager
-def update_compute_token_logprobs():
+def update_compute_topk_logprobs():
     from vllm.v1.worker.gpu.sample import logprob
-    original_compute_token_logprobs = logprob.compute_token_logprobs
+    original_compute_topk_logprobs = logprob.compute_topk_logprobs
     try:
-        logprob.compute_token_logprobs = ascend_compute_token_logprobs
+        logprob.compute_topk_logprobs = ascend_compute_topk_logprobs
         yield
     finally:
-        logprob.compute_token_logprobs = original_compute_token_logprobs
+        logprob.compute_topk_logprobs = original_compute_topk_logprobs
 
 
 class AscendSampler(Sampler):
@@ -47,7 +47,7 @@ class AscendSampler(Sampler):
         input_ids: torch.Tensor,
         expanded_local_pos: torch.Tensor,
     ):
-        with update_compute_token_logprobs():
+        with update_compute_topk_logprobs():
             return super().__call__(
                 logits,
                 idx_mapping,

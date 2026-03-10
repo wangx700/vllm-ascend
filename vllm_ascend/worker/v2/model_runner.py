@@ -35,7 +35,8 @@ from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm_ascend.worker.v2.aclgraph_utils import AclGraphManager
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata, build_attn_state
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
-from vllm_ascend.worker.v2.sample.sampler import AscendSampler
+from vllm_ascend.worker.v2.sample.sampler import AscendSampler, update_compute_topk_logprobs
+from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm_ascend.worker.v2.spec_decode import init_speculator
 from vllm_ascend.worker.v2.spec_decode.eagle import AscendEagleSpeculator
 from vllm_ascend.worker.v2.states import AscendRequestState
@@ -58,6 +59,7 @@ class NPUModelRunner(GPUModelRunner):
         del self.input_buffers
         del self.sampler
         del self.speculator
+        del self.prompt_logprobs_worker
 
         # NPU specific initializations can be added below.
         self.cudagraph_manager: AclGraphManager = AclGraphManager(
@@ -112,6 +114,10 @@ class NPUModelRunner(GPUModelRunner):
             device="cpu",
             pin_memory=True,
         )
+
+        # Reinitialize prompt_logprobs_worker with the optimized compute_topk_logprobs
+        with update_compute_topk_logprobs():
+            self.prompt_logprobs_worker = PromptLogprobsWorker(self.max_num_reqs)
 
     def prepare_inputs(
         self,
