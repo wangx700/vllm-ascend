@@ -35,12 +35,12 @@ from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm_ascend.worker.v2.aclgraph_utils import AclGraphManager
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata, build_attn_state
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
-from vllm_ascend.worker.v2.sample.sampler import AscendSampler, update_compute_topk_logprobs
-from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
+from vllm_ascend.worker.v2.sample.sampler import AscendSampler
 from vllm_ascend.worker.v2.spec_decode import init_speculator
 from vllm_ascend.worker.v2.spec_decode.eagle import AscendEagleSpeculator
 from vllm_ascend.worker.v2.states import AscendRequestState
 from vllm_ascend.worker.v2.utils import torch_cuda_wrapper
+from vllm_ascend.worker.v2.sample.prompt_logprob import AscendPromptLogprobsWorker
 
 logger = init_logger(__name__)
 
@@ -60,7 +60,6 @@ class NPUModelRunner(GPUModelRunner):
         del self.sampler
         del self.speculator
         del self.prompt_logprobs_worker
-
         # NPU specific initializations can be added below.
         self.cudagraph_manager: AclGraphManager = AclGraphManager(
             self.vllm_config,
@@ -101,6 +100,8 @@ class NPUModelRunner(GPUModelRunner):
             logprobs_mode=self.model_config.logprobs_mode,
             num_speculative_tokens=self.num_speculative_steps + 1,
         )
+        # Reinitialize prompt_logprobs_worker to adjust triton operators
+        self.prompt_logprobs_worker = AscendPromptLogprobsWorker(self.max_num_reqs)
 
         # we need to copy num_computed_tokens back to cpu to help
         # update actual seq_lens_cpu. gpu attention backend doesn't need these
@@ -114,10 +115,6 @@ class NPUModelRunner(GPUModelRunner):
             device="cpu",
             pin_memory=True,
         )
-
-        # Reinitialize prompt_logprobs_worker with the optimized compute_topk_logprobs
-        with update_compute_topk_logprobs():
-            self.prompt_logprobs_worker = PromptLogprobsWorker(self.max_num_reqs)
 
     def prepare_inputs(
         self,

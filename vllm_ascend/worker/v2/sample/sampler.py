@@ -16,24 +16,16 @@
 #
 import numpy as np
 import torch
-from contextlib import contextmanager
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.worker.gpu.sample.gumbel import apply_temperature
 from vllm.v1.worker.gpu.sample.min_p import apply_min_p
 from vllm.v1.worker.gpu.sample.sampler import Sampler
+from vllm.v1.worker.gpu.sample.output import SamplerOutput
+from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
 
+from vllm.vllm.v1.worker.gpu.metrics.logits import get_num_nans
 from vllm_ascend.worker.v2.sample.gumbel import gumbel_sample
-from vllm_ascend.worker.v2.sample.logprob import compute_topk_logprobs as ascend_compute_topk_logprobs
-
-@contextmanager
-def update_compute_topk_logprobs():
-    from vllm.v1.worker.gpu.sample import logprob
-    original_compute_topk_logprobs = logprob.compute_topk_logprobs
-    try:
-        logprob.compute_topk_logprobs = ascend_compute_topk_logprobs
-        yield
-    finally:
-        logprob.compute_topk_logprobs = original_compute_topk_logprobs
+from vllm_ascend.worker.v2.sample.logprob import compute_topk_logprobs
 
 
 class AscendSampler(Sampler):
@@ -46,17 +38,41 @@ class AscendSampler(Sampler):
         pos: torch.Tensor,
         input_ids: torch.Tensor,
         expanded_local_pos: torch.Tensor,
-    ):
-        with update_compute_topk_logprobs():
-            return super().__call__(
-                logits,
-                idx_mapping,
-                idx_mapping_np,
-                cu_num_logits_np,
-                pos,
-                input_ids,
-                expanded_local_pos,
+    ) -> SamplerOutput:
+        # NOTE(woosuk): We intentionally compute num_nans before sampling to make clear
+        # that num_nans is computed before applying penalties and temperature.
+        num_nans = get_num_nans(logits) if self.compute_nans else None
+        sampled, processed_logits = self.sample(
+            logits,
+            idx_mapping,
+            idx_mapping_np,
+            pos,
+            input_ids,
+            expanded_local_pos,
+        )
+
+        max_num_logprobs = self.sampling_states.max_num_logprobs(idx_mapping_np)
+        if max_num_logprobs != NO_LOGPROBS:
+            if self.logprobs_mode == "processed_logprobs":
+                logits = processed_logits
+            expanded_logits = logits.shape[0] != idx_mapping_np.shape[0]
+            cu_num_logits = cu_num_logits_np.tolist() if expanded_logits else None
+            logprobs_tensors = compute_topk_logprobs(
+                logits, max_num_logprobs, sampled, cu_num_logits
             )
+        else:
+            logprobs_tensors = None
+
+        # These are GPU tensors.
+        sampler_output = SamplerOutput(
+            # The sampled tokens are expanded to 2D tensor with shape
+            # [num_requests, 1], where each row represents one generated
+            # token per request.
+            sampled_token_ids=sampled.view(-1, 1),
+            logprobs_tensors=logprobs_tensors,
+            num_nans=num_nans,
+        )
+        return sampler_output
 
     def sample(
         self,
