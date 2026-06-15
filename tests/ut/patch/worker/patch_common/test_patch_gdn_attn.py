@@ -14,9 +14,7 @@ from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.kv_cache_interface import MambaSpec
 from vllm_ascend.ops.gdn import (
-    get_non_spec_causal_conv1d_host_args,
     get_non_spec_chunked_prefill_meta,
-    to_int64_tuple,
 )
 from vllm_ascend.ops.triton.fla import utils as fla_utils
 from vllm_ascend.ops.triton.fla.utils import (
@@ -234,14 +232,6 @@ def _patch_missing_runtime_cdiv(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-def _expected_conv1d_host_args(attn_metadata) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-    return (
-        to_int64_tuple(attn_metadata.non_spec_query_start_loc),
-        to_int64_tuple(attn_metadata.non_spec_state_indices_tensor),
-        to_int64_tuple(attn_metadata.has_initial_state),
-    )
-
-
 @pytest.mark.parametrize(
     ("batch_spec", "num_speculative_tokens", "num_decode_draft_tokens_cpu"),
     [
@@ -293,8 +283,6 @@ def test_non_spec_prefill_fallback_meta_matches_original_inputs_and_runtime_help
     assert fallback_meta.causal_conv1d is not None
     assert fallback_meta.chunk is not None
 
-    assert get_non_spec_causal_conv1d_host_args(attn_metadata) == _expected_conv1d_host_args(attn_metadata)
-
     _assert_chunk_meta_matches_runtime(
         builder,
         fallback_meta.chunk,
@@ -338,22 +326,6 @@ def test_build_non_spec_causal_conv1d_host_meta_requires_has_initial_state():
             builder,
             attn_metadata,
             non_spec_query_start_loc_cpu=torch.tensor([0, 4, 12], dtype=torch.int32),
-        )
-
-
-def test_get_non_spec_causal_conv1d_host_args_requires_prefill_fallback_meta():
-    attn_metadata = SimpleNamespace(
-        non_spec_prefill_fallback_meta=None,
-        non_spec_causal_conv1d_meta=SimpleNamespace(
-            query_start_loc_opt=(0, 4, 12),
-            cache_indices_opt=(3, 9),
-            initial_state_mode_opt=(1, 0),
-        ),
-    )
-
-    with pytest.raises(RuntimeError, match="non_spec_prefill_fallback_meta\\.causal_conv1d"):
-        get_non_spec_causal_conv1d_host_args(
-            attn_metadata,
         )
 
 

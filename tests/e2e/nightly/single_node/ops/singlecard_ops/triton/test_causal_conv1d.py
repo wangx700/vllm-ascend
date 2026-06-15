@@ -290,6 +290,91 @@ def test_causal_conv1d_update_with_batch_gather(batch_size, with_padding, dim,
     torch.npu.reset_peak_memory_stats()
 
 
+@pytest.mark.parametrize('has_initial_state', [False, True])
+@pytest.mark.parametrize('itype', [torch.bfloat16])
+@pytest.mark.parametrize('silu_activation', [True])
+@pytest.mark.parametrize('has_bias', [True])
+@pytest.mark.parametrize('seq_len', [[128, 1024, 2048, 4096]])
+@pytest.mark.parametrize('extra_state_len', [0])
+@pytest.mark.parametrize('width', [4])
+@pytest.mark.parametrize('dim', [2048])
+def test_causal_conv1d_update_npu_vs_cann_prefill(
+    dim, width, extra_state_len, seq_len, has_bias, silu_activation, itype,
+    has_initial_state,
+):
+    torch.random.manual_seed(42)
+    device = "npu"
+    cu_seqlen, num_seq = sum(seq_len), len(seq_len)
+    state_len = width - 1 + extra_state_len
+
+    x_2d = torch.randn(cu_seqlen, dim, device=device, dtype=itype)
+    weight = torch.randn(dim, width, device=device, dtype=itype)
+    query_start_loc = torch.cumsum(
+        torch.tensor([0] + seq_len, device=device, dtype=torch.int32), dim=0
+    )
+    cache_indices = torch.arange(num_seq, device=device, dtype=torch.int32)
+    has_initial_state_tensor = torch.tensor(
+        [has_initial_state] * num_seq, device=device, dtype=torch.bool
+    )
+    activation = None if not silu_activation else "silu"
+
+    if has_initial_state:
+        conv_states_cann = torch.randn(
+            (num_seq, state_len, dim), device=device, dtype=itype
+        ).transpose(-1, -2)
+        conv_states_triton = conv_states_cann.clone()
+    else:
+        conv_states_cann = torch.zeros(
+            (num_seq, state_len, dim), device=device, dtype=itype
+        ).transpose(-1, -2)
+        conv_states_triton = conv_states_cann.clone()
+
+    bias = torch.randn(dim, device=device, dtype=itype) if has_bias else None
+
+    activation_num = 1 if activation else 0
+    out_cann = torch.ops._C_ascend.npu_causal_conv1d_custom(
+        x_2d,
+        weight.transpose(0, 1),
+        conv_state=conv_states_cann,
+        bias_opt=bias,
+        query_start_loc_opt=to_int64_tuple(query_start_loc),
+        cache_indices_opt=to_int64_tuple(cache_indices),
+        initial_state_mode_opt=to_int64_tuple(has_initial_state_tensor),
+        num_accepted_tokens_opt=[],
+        activation_mode=activation_num,
+        pad_slot_id=PAD_SLOT_ID,
+        run_mode=0,
+    )
+
+    if has_initial_state is not None:
+        no_init_mask = ~has_initial_state_tensor
+        if no_init_mask.any():
+            conv_states_triton[cache_indices[no_init_mask]] = 0
+
+    max_query_len = int(
+        (query_start_loc[1:] - query_start_loc[:-1]).max()
+    )
+    out_triton = causal_conv1d_update(
+        x_2d,
+        conv_states_triton.transpose(-1, -2),
+        weight,
+        bias,
+        activation=activation,
+        conv_state_indices=cache_indices,
+        query_start_loc=query_start_loc,
+        max_query_len=max_query_len,
+        pad_slot_id=PAD_SLOT_ID,
+        validate_data=False,
+    )
+
+    validate_cmp(out_triton, out_cann, itype)
+    validate_cmp(conv_states_triton, conv_states_cann, itype)
+
+    gc.collect()
+    torch.npu.empty_cache()
+    torch.npu.reset_peak_memory_stats()
+
+
 def test_causal_conv1d_update_qwen3_next_shape():
     device = "npu"
     itype = torch.bfloat16
