@@ -303,6 +303,7 @@ def test_causal_conv1d_update_npu_vs_cann_prefill(
     has_initial_state,
 ):
     torch.random.manual_seed(42)
+    enable_custom_op()
     device = "npu"
     cu_seqlen, num_seq = sum(seq_len), len(seq_len)
     state_len = width - 1 + extra_state_len
@@ -319,15 +320,18 @@ def test_causal_conv1d_update_npu_vs_cann_prefill(
     activation = None if not silu_activation else "silu"
 
     if has_initial_state:
-        conv_states_cann = torch.randn(
+        conv_states_base = torch.randn(
             (num_seq, state_len, dim), device=device, dtype=itype
-        ).transpose(-1, -2)
-        conv_states_triton = conv_states_cann.clone()
+        )
+        conv_states_cann = conv_states_base.clone()
+        conv_states_triton = conv_states_base.transpose(-1, -2).contiguous().clone()
     else:
         conv_states_cann = torch.zeros(
             (num_seq, state_len, dim), device=device, dtype=itype
-        ).transpose(-1, -2)
-        conv_states_triton = conv_states_cann.clone()
+        )
+        conv_states_triton = torch.zeros(
+            (num_seq, dim, state_len), device=device, dtype=itype
+        )
 
     bias = torch.randn(dim, device=device, dtype=itype) if has_bias else None
 
@@ -346,17 +350,15 @@ def test_causal_conv1d_update_npu_vs_cann_prefill(
         run_mode=0,
     )
 
-    if has_initial_state is not None:
-        no_init_mask = ~has_initial_state_tensor
-        if no_init_mask.any():
-            conv_states_triton[cache_indices[no_init_mask]] = 0
+    if not has_initial_state:
+        conv_states_triton.zero_()
 
     max_query_len = int(
         (query_start_loc[1:] - query_start_loc[:-1]).max()
     )
     out_triton = causal_conv1d_update(
         x_2d,
-        conv_states_triton.transpose(-1, -2),
+        conv_states_triton,
         weight,
         bias,
         activation=activation,
@@ -368,7 +370,7 @@ def test_causal_conv1d_update_npu_vs_cann_prefill(
     )
 
     validate_cmp(out_triton, out_cann, itype)
-    validate_cmp(conv_states_triton, conv_states_cann, itype)
+    validate_cmp(conv_states_triton.transpose(-1, -2), conv_states_cann, itype)
 
     gc.collect()
     torch.npu.empty_cache()
