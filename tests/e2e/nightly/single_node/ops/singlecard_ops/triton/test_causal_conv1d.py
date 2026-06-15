@@ -320,18 +320,15 @@ def test_causal_conv1d_update_npu_vs_cann_prefill(
     activation = None if not silu_activation else "silu"
 
     if has_initial_state:
-        conv_states_base = torch.randn(
+        storage_cann = torch.randn(
             (num_seq, state_len, dim), device=device, dtype=itype
         )
-        conv_states_cann = conv_states_base.clone()
-        conv_states_triton = conv_states_base.transpose(-1, -2).contiguous().clone()
+        storage_triton = storage_cann.clone()
     else:
-        conv_states_cann = torch.zeros(
+        storage_cann = torch.zeros(
             (num_seq, state_len, dim), device=device, dtype=itype
         )
-        conv_states_triton = torch.zeros(
-            (num_seq, dim, state_len), device=device, dtype=itype
-        )
+        storage_triton = storage_cann.clone()
 
     bias = torch.randn(dim, device=device, dtype=itype) if has_bias else None
 
@@ -339,7 +336,7 @@ def test_causal_conv1d_update_npu_vs_cann_prefill(
     out_cann = torch.ops._C_ascend.npu_causal_conv1d_custom(
         x_2d,
         weight.transpose(0, 1),
-        conv_state=conv_states_cann,
+        conv_state=storage_cann,
         bias_opt=bias,
         query_start_loc_opt=to_int64_tuple(query_start_loc),
         cache_indices_opt=to_int64_tuple(cache_indices),
@@ -351,14 +348,14 @@ def test_causal_conv1d_update_npu_vs_cann_prefill(
     )
 
     if not has_initial_state:
-        conv_states_triton.zero_()
+        storage_triton.zero_()
 
     max_query_len = int(
         (query_start_loc[1:] - query_start_loc[:-1]).max()
     )
     out_triton = causal_conv1d_update(
         x_2d,
-        conv_states_triton,
+        storage_triton.transpose(-1, -2),
         weight,
         bias,
         activation=activation,
@@ -370,7 +367,7 @@ def test_causal_conv1d_update_npu_vs_cann_prefill(
     )
 
     validate_cmp(out_triton, out_cann, itype)
-    validate_cmp(conv_states_triton.transpose(-1, -2), conv_states_cann, itype)
+    validate_cmp(storage_triton, storage_cann, itype)
 
     gc.collect()
     torch.npu.empty_cache()
