@@ -491,35 +491,6 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
             hidden_shape_before_permute,
         ) = self._dispatch_preprocess(hidden_states, topk_ids)
 
-        # Exchange TP-split LoRA indices through the same permute +
-        # all_to_all pipeline so that each EP rank receives the
-        # correct lora_id for every dispatched token.
-        exchanged_lora_indices = None
-        if split_lora_indices is not None:
-            lora_dtype = split_lora_indices.dtype
-            split_lora_float = split_lora_indices.to(torch.float32)
-
-            # 1st permute: same reordering as tokens
-            permuted_lora, _ = torch_npu.npu_moe_token_permute(
-                split_lora_float.unsqueeze(-1), topk_ids, num_out_tokens=topk_ids.numel()
-            )
-            permuted_lora = permuted_lora.squeeze(-1)
-
-            # all_to_all exchange
-            _, exchanged_lora, handle = async_all_to_all(
-                permuted_lora, output_splits, input_splits, self.ep_group
-            )
-            handle.wait()
-            del permuted_lora
-
-            # 2nd permute (sort by expert within the rank) when > 1 local expert
-            if self.num_local_experts > 1:
-                exchanged_lora, _ = torch_npu.npu_moe_token_permute(
-                    exchanged_lora.unsqueeze(-1), global_input_tokens_local_experts_indices
-                )
-                exchanged_lora = exchanged_lora.squeeze(-1)
-            exchanged_lora_indices = exchanged_lora.to(lora_dtype)
-
         dynamic_scale_after_all2all = None
         if with_quant:
             dst_type = torch.float8_e4m3fn if token_dispatch_input.quant.is_fp8 else torch.int8
@@ -538,7 +509,7 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
         permute1_ep_all_to_all_handle.wait()
         permutated_local_input_tokens.untyped_storage().resize_(0)
 
-        # Postprocess
+        # Postprocess (2nd permute for hidden states)
         global_input_tokens, dynamic_scale_final, reversed_global_input_permutation_mapping = (
             self._dispatch_postprocess(
                 global_input_tokens,
@@ -547,6 +518,42 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
                 with_quant,
             )
         )
+
+        # Exchange TP-split LoRA indices through the same pipeline as hidden
+        # states.  Both permute mappings (reversed_local_* and reversed_global_*)
+        # are now available from the hidden states dispatch, so we derive the
+        # permuted lora indices via pure indexing without additional NPU kernels.
+        exchanged_lora_indices = None
+        if split_lora_indices is not None:
+            lora_dtype = split_lora_indices.dtype
+
+            # 1st permute: same reordering as hidden states.
+            # split_lora_indices [num_tokens] → repeat_interleave(top_k)
+            # → [num_tokens * top_k] = same expansion as hidden_states.
+            expanded_lora = split_lora_indices.to(torch.float32).repeat_interleave(
+                topk_ids.shape[1]
+            )
+            permuted_lora = expanded_lora[
+                reversed_local_input_permutation_mapping.to(torch.int64)
+            ]
+
+            # all_to_all exchange (output_splits / input_splits shared with hidden states)
+            _, exchanged_lora, handle = async_all_to_all(
+                permuted_lora, output_splits, input_splits, self.ep_group
+            )
+            handle.wait()
+            del permuted_lora
+
+            # 2nd permute (sort by expert within the rank) when > 1 local expert
+            if self.num_local_experts > 1:
+                assert reversed_global_input_permutation_mapping is not None, (
+                    "reversed_global_input_permutation_mapping must be non-None "
+                    "when num_local_experts > 1"
+                )
+                exchanged_lora = exchanged_lora[
+                    reversed_global_input_permutation_mapping.to(torch.int64)
+                ]
+            exchanged_lora_indices = exchanged_lora.to(lora_dtype)
 
         return MoETokenDispatchOutput(
             hidden_states=global_input_tokens,

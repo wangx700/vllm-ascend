@@ -484,6 +484,7 @@ def unified_apply_mlp(*, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
             topk_scales=topk_scales,
             need_trans=need_trans,
             swiglu_limit=swiglu_limit,
+            lora_params=lora_params,
         )
 
     assert w1_scale is not None and w2_scale is not None
