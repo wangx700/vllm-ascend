@@ -147,6 +147,8 @@ def build_fused_experts_input(
     w1_offset: torch.Tensor | None = None,
     w2_offset: torch.Tensor | None = None,
     swiglu_limit: float | None = 0.0,
+    lora_context: Any = None,
+    split_lora_indices: torch.Tensor | None = None,
 ) -> MoEFusedExpertsInput:
     if not vllm_version_is("0.23.0") and swiglu_limit is None:
         swiglu_limit = 0.0
@@ -193,6 +195,8 @@ def build_fused_experts_input(
             is_per_channel_weight=is_per_channel_weight,
         ),
         swiglu_limit=swiglu_limit,
+        lora_context=lora_context,
+        split_lora_indices=split_lora_indices,
     )
 
 
@@ -207,6 +211,7 @@ def build_token_dispatch_input(
         topk_ids=fused_experts_input.topk_ids if topk_ids is None else topk_ids,
         routing=fused_experts_input.routing,
         quant=fused_experts_input.quant,
+        split_lora_indices=fused_experts_input.split_lora_indices,
     )
 
 
@@ -215,6 +220,7 @@ def build_mlp_compute_input(
     fused_experts_input: MoEFusedExpertsInput,
     token_dispatch_output: MoETokenDispatchOutput[TMoECombineMetadata],
     use_fusion_ops: bool,
+    lora_params: Any = None,
 ) -> MoEMlpComputeInput:
     if fused_experts_input.quant.is_mxfp and fused_experts_input.quant.mxfp is None:
         raise ValueError("fused_experts_input.quant.mxfp is required for MXFP quant types.")
@@ -241,6 +247,7 @@ def build_mlp_compute_input(
         need_trans=fused_experts_input.need_trans,
         dynamic_eplb=fused_experts_input.dynamic_eplb,
         swiglu_limit=fused_experts_input.swiglu_limit,
+        lora_params=lora_params,
     )
 
 

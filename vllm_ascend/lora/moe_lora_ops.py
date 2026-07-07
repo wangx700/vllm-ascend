@@ -1,0 +1,139 @@
+import torch
+
+from vllm_ascend.lora.lora_ops import bgmv_expand, bgmv_expand_slice, bgmv_shrink
+
+
+def _do_bgmv_shrink(hidden_states, lora_a_merged, buffer, lora_expert_indices, scale):
+    bgmv_shrink(hidden_states, lora_a_merged, buffer, lora_expert_indices, scale)
+
+
+def _do_bgmv_expand(buffer, lora_b_merged, output, lora_expert_indices,
+                    slice_offset=0, slice_size=None, add_inputs=True):
+    if slice_size is None:
+        slice_size = output.shape[1]
+    if slice_offset == 0 and slice_size == output.shape[1]:
+        bgmv_expand(buffer, lora_b_merged, output, lora_expert_indices, add_inputs)
+    else:
+        bgmv_expand_slice(buffer, lora_b_merged, output, lora_expert_indices,
+                          slice_offset, slice_size, add_inputs)
+
+
+def _build_lora_expert_indices(
+    lora_indices: torch.Tensor,
+    expanded_row_idx: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_experts: int,
+) -> torch.Tensor:
+    """Construct row indices into the stacked LoRA weight matrix for each dispatched token.
+
+    LoRA weights are stored as lora_a_merged = lora_a.reshape(num_loras * num_experts, r, -1),
+    where the row-index layout is:
+      rows 0..(E-1)        -> lora_0 x expert_0..E-1
+      rows E..(2E-1)       -> lora_1 x expert_0..E-1
+      ...
+      rows (L-1)*E..(L*E-1)-> lora_L-1 x expert_0..E-1
+
+    For each dispatched token j this function computes:
+      lora_expert_indices[j] = dispatched_lora_id * num_experts + dispatched_expert_id
+
+    Args:
+        lora_indices:       [num_tokens]          LoRA adapter ID for each original token
+                            (0..max_loras-1 or -1 means no LoRA)
+        expanded_row_idx:   [num_dispatched_tokens] flattened source index after dispatch sorting,
+                            encoded as token_idx * top_k + k where k is the topk slot
+                            (negative values indicate padding tokens)
+        topk_ids:           [num_tokens, top_k]   expert IDs selected per token
+                            (physical IDs after log2phy mapping)
+        num_experts:        int                   number of local experts E
+
+    Returns:
+        lora_expert_indices: [num_dispatched_tokens] row index for each dispatched token
+                             in lora_a_merged (-1 means no LoRA for that token)
+    """
+    top_k = topk_ids.shape[1]
+
+    # [num_tokens] -> [num_tokens * top_k], replicate lora_indices by top_k
+    expanded_lora_indices = lora_indices.repeat_interleave(top_k)
+
+    num_dispatched_tokens = expanded_row_idx.shape[0]
+
+    # [num_dispatched_tokens], abs() converts negative padding indices to valid indices
+    perm = torch.abs(expanded_row_idx)[:num_dispatched_tokens]
+
+    # [num_dispatched_tokens], index expanded lora_indices with the permutation
+    dispatched_lora_indices = expanded_lora_indices[perm]
+
+    # [num_tokens * top_k] -> flatten all token expert IDs
+    flat_topk_ids = topk_ids.reshape(-1)
+
+    # [num_dispatched_tokens], get the expert ID for each dispatched token
+    dispatched_expert_ids = flat_topk_ids[perm]
+
+    # [num_dispatched_tokens], final index: lora_id * E + expert_id
+    lora_expert_indices = dispatched_lora_indices * num_experts + dispatched_expert_ids.to(lora_indices.dtype)
+
+    # Mark no-LoRA tokens as -1; bgmv kernel skips these rows
+    lora_expert_indices[dispatched_lora_indices < 0] = -1
+
+    return lora_expert_indices
+
+
+def apply_moe_lora_w13(
+    gate_up_out: torch.Tensor,
+    hidden_states: torch.Tensor,
+    w13_lora_a_stacked: tuple[torch.Tensor, ...],
+    w13_lora_b_stacked: tuple[torch.Tensor, ...],
+    lora_expert_indices: torch.Tensor,
+    scale: float,
+):
+    r = w13_lora_b_stacked[0].shape[-1]
+    num_dispatched_tokens = gate_up_out.shape[0]
+
+    for slice_idx in range(len(w13_lora_a_stacked)):
+        lora_a = w13_lora_a_stacked[slice_idx]
+        lora_b = w13_lora_b_stacked[slice_idx]
+        num_loras = lora_a.shape[0]
+        num_experts = lora_a.shape[1]
+        lora_a_merged = lora_a.reshape(num_loras * num_experts, r, -1)
+        lora_b_merged = lora_b.reshape(num_loras * num_experts, -1, r)
+
+        buffer = torch.zeros(
+            (num_dispatched_tokens, r),
+            dtype=torch.float32,
+            device=gate_up_out.device,
+        )
+
+        _do_bgmv_shrink(hidden_states, lora_a_merged, buffer, lora_expert_indices, scale)
+
+        _do_bgmv_expand(buffer, lora_b_merged, gate_up_out, lora_expert_indices,
+                        slice_offset=slice_idx * lora_b_merged.shape[1],
+                        slice_size=lora_b_merged.shape[1],
+                        add_inputs=True)
+
+
+def apply_moe_lora_w2(
+    activated_out: torch.Tensor,
+    w2_output: torch.Tensor,
+    w2_lora_a_stacked: tuple[torch.Tensor, ...],
+    w2_lora_b_stacked: tuple[torch.Tensor, ...],
+    lora_expert_indices: torch.Tensor,
+    scale: float,
+):
+    r = w2_lora_b_stacked[0].shape[-1]
+    num_dispatched_tokens = activated_out.shape[0]
+
+    lora_a = w2_lora_a_stacked[0]
+    lora_b = w2_lora_b_stacked[0]
+    num_loras = lora_a.shape[0]
+    num_experts = lora_a.shape[1]
+    lora_a_merged = lora_a.reshape(num_loras * num_experts, r, -1)
+    lora_b_merged = lora_b.reshape(num_loras * num_experts, -1, r)
+
+    buffer = torch.zeros(
+        (num_dispatched_tokens, r),
+        dtype=torch.float32,
+        device=activated_out.device,
+    )
+
+    _do_bgmv_shrink(activated_out, lora_a_merged, buffer, lora_expert_indices, scale)
+    _do_bgmv_expand(buffer, lora_b_merged, w2_output, lora_expert_indices, add_inputs=True)

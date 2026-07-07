@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Generic, TypeVar
+from typing import Any, Generic, TypeVar
 
 import numpy as np
 import torch
@@ -37,6 +37,41 @@ class MoEPrepareOutput:
     mc2_mask: torch.Tensor | None
     padded_hidden_states_shape: torch.Size | None
     pertoken_scale: torch.Tensor | None = None
+    # TP-split copy of token_lora_indices for AlltoAll paths that split
+    # tokens across TP ranks.  None for AllGather / non-LoRA paths.
+    split_lora_indices: torch.Tensor | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MoELoRAContext:
+    """LoRA context injected into the MoE pipeline by the LoRA adapter layer.
+
+    Holds stacked LoRA A/B weight tuples for gate_up (w13) and down (w2)
+    projections, the PunicaWrapper for per-token LoRA ID lookup, and the
+    number of local experts on this rank.
+    """
+
+    w13_lora_a_stacked: tuple[torch.Tensor, ...]
+    w13_lora_b_stacked: tuple[torch.Tensor, ...]
+    w2_lora_a_stacked: tuple[torch.Tensor, ...]
+    w2_lora_b_stacked: tuple[torch.Tensor, ...]
+    punica_wrapper: Any
+    num_experts: int
+
+
+@dataclass(frozen=True, slots=True)
+class MoELoRAParams:
+    """Per-expert LoRA parameters consumed by MLP compute.
+
+    The lora_expert_indices tensor maps each dispatched token to a row in
+    the stacked weight matrices (shape (num_loras * num_experts, rank, dim)).
+    """
+
+    w13_lora_a_stacked: tuple[torch.Tensor, ...]
+    w13_lora_b_stacked: tuple[torch.Tensor, ...]
+    w2_lora_a_stacked: tuple[torch.Tensor, ...]
+    w2_lora_b_stacked: tuple[torch.Tensor, ...]
+    lora_expert_indices: torch.Tensor
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +104,10 @@ class MoEFusedExpertsInput:
     need_trans: bool = False
     dynamic_eplb: bool = False
     swiglu_limit: float = 0.0
+    lora_context: MoELoRAContext | None = None
+    # TP-split token_lora_indices for AlltoAll paths (carried through
+    # dispatch -> all_to_all exchange -> combine_metadata).
+    split_lora_indices: torch.Tensor | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +119,9 @@ class MoETokenDispatchInput:
     topk_ids: torch.Tensor
     routing: MoERoutingParams
     quant: MoEQuantParams
+    # TP-split copy of token_lora_indices (only populated by AlltoAll
+    # paths that need to exchange them across EP ranks).  None otherwise.
+    split_lora_indices: torch.Tensor | None = None
 
 
 # dispatch carry-over state consumed by combine
@@ -112,6 +154,9 @@ class MoEAllToAllCombineMetadata:
     reversed_global_input_permutation_mapping: torch.Tensor | None
     hidden_shape: torch.Size
     hidden_shape_before_permute: torch.Size
+    # LoRA token indices after permute + all_to_all exchange, correctly
+    # aligned with the dispatched token order.  None when LoRA is disabled.
+    exchanged_lora_indices: torch.Tensor | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,11 +186,14 @@ class MoEMlpComputeInput:
     need_trans: bool = False
     dynamic_eplb: bool = False
     swiglu_limit: float = 0.0
+    lora_params: MoELoRAParams | None = None
 
 
 __all__ = [
     "MoEPrepareOutput",
     "MoEWeights",
+    "MoELoRAContext",
+    "MoELoRAParams",
     "MoEFusedExpertsInput",
     "MoETokenDispatchInput",
     "MoEMC2CombineMetadata",

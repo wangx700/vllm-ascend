@@ -26,6 +26,7 @@ from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.mxfp_compat import (
     ensure_mxfp8_moe_available,
 )
+from vllm_ascend.lora.moe_lora_ops import apply_moe_lora_w13, apply_moe_lora_w2
 from vllm_ascend.ops.activation import AscendSwigluOAIAndMul, AscendSwigluStepAndMul
 from vllm_ascend.ops.fused_moe.moe_runtime_args import MoEMlpComputeInput
 from vllm_ascend.quantization.quant_type import QuantType
@@ -373,6 +374,7 @@ def unquant_apply_mlp(
     topk_scales: torch.Tensor | None = None,
     need_trans: bool = True,
     swiglu_limit: float = 0.0,
+    lora_params=None,
 ) -> torch.Tensor:
     if need_trans:
         w1 = w1.transpose(1, 2)
@@ -387,6 +389,16 @@ def unquant_apply_mlp(
         group_type=0,
         group_list=group_list,
     )[0]
+
+    if lora_params is not None:
+        apply_moe_lora_w13(
+            gate_up_out=gate_up_out,
+            hidden_states=hidden_states,
+            w13_lora_a_stacked=lora_params.w13_lora_a_stacked,
+            w13_lora_b_stacked=lora_params.w13_lora_b_stacked,
+            lora_expert_indices=lora_params.lora_expert_indices,
+            scale=1.0,
+        )
 
     if activation == MoEActivation.SWIGLUOAI:
         num_experts, _, hidden_size = w1.shape
@@ -418,6 +430,17 @@ def unquant_apply_mlp(
         group_type=0,
         group_list=group_list,
     )[0]
+
+    if lora_params is not None:
+        apply_moe_lora_w2(
+            activated_out=gate_up_out,
+            w2_output=hidden_states,
+            w2_lora_a_stacked=lora_params.w2_lora_a_stacked,
+            w2_lora_b_stacked=lora_params.w2_lora_b_stacked,
+            lora_expert_indices=lora_params.lora_expert_indices,
+            scale=1.0,
+        )
+
     return hidden_states, None
 
 
@@ -446,6 +469,7 @@ def unified_apply_mlp(*, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
     dynamic_eplb = mlp_compute_input.dynamic_eplb
     fusion = mlp_compute_input.fusion
     swiglu_limit = mlp_compute_input.swiglu_limit
+    lora_params = getattr(mlp_compute_input, 'lora_params', None)
 
     if not mlp_compute_input.quant.is_quant:
         return unquant_apply_mlp(
