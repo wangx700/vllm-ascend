@@ -604,6 +604,10 @@ else:
 
                     set_flash_common3_context(topk_weights=topk_weights, topk_ids=topk_ids)
 
+            # Capture actual token count before prepare() may pad/split.
+            # Needed for correct TP-split of token_lora_indices below.
+            num_tokens_before_prepare = hidden_states.shape[0]
+
             prepare_output = _EXTRA_CTX.moe_comm_method.prepare(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
@@ -623,6 +627,13 @@ else:
             # to the correct expert-owning rank together with the tokens.
             # torch.tensor_split handles unequal splits (e.g. 101 tokens ->
             # [50, 51]), which matches the token split in prepare().
+            # IMPORTANT: token_lora_indices has max_num_batched_tokens elements;
+            # we must narrow to actual num_tokens and apply the SAME padding
+            # and TP-split logic as PrepareAndFinalizeWithAll2All.prepare().
+            #
+            # Pad formula (from PrepareAndFinalizeWithAll2All.prepare):
+            #   pad_size = tp_size - num_tokens  (pad if < tp_size)
+            # Split: torch.tensor_split(padded, tp_size, dim=0)
             split_lora_indices = None
             lora_ctx = getattr(self.routed_experts, 'get_lora_context', lambda: None)()
             if lora_ctx is not None:
@@ -630,10 +641,16 @@ else:
                     get_tensor_model_parallel_rank,
                     get_tensor_model_parallel_world_size,
                 )
-                indices = lora_ctx.punica_wrapper.token_lora_indices
+                # num_tokens was captured before prepare() overwrote hidden_states
+                indices_full = lora_ctx.punica_wrapper.token_lora_indices
+                indices = indices_full[:num_tokens_before_prepare]
                 tp_size = get_tensor_model_parallel_world_size()
                 tp_rank = get_tensor_model_parallel_rank()
                 if tp_size > 1:
+                    # Apply the same padding as prepare()
+                    pad_size = tp_size - num_tokens_before_prepare
+                    if pad_size > 0:
+                        indices = torch.nn.functional.pad(indices, (0, pad_size))
                     split = torch.tensor_split(indices, tp_size, dim=0)
                     split_lora_indices = split[tp_rank].contiguous()
                 else:

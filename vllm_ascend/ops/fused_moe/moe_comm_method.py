@@ -220,26 +220,37 @@ class MoECommMethod(ABC):
         elif isinstance(combine_metadata, MoEAllToAllCombineMetadata):
             # AlltoAll: tokens are split across TP ranks then exchanged
             # via all_to_all.  The token dispatcher has already permuted
-            # and exchanged a TP-split copy of token_lora_indices; use
-            # those exchanged indices which are aligned with the
-            # dispatched token order.
+            # and exchanged a TP-split copy of token_lora_indices; after
+            # the second permute (sort-by-expert) the lora indices are
+            # already aligned with the dispatched token order and grouped
+            # by local expert.  Build lora_expert_indices directly from
+            # the exchanged indices + group_list (tokens_per_expert).
             lora_indices = combine_metadata.exchanged_lora_indices
             if lora_indices is None:
-                # Fallback (known to be incorrect for AlltoAll + TP>1).
-                lora_indices = lora_context.punica_wrapper.token_lora_indices
-            # routed_topk_ids contains GLOBAL expert IDs (0..global_E-1)
-            # but the LoRA buffers are indexed by LOCAL expert position
-            # (0..local_E-1).  Convert global -> local.
-            from vllm.distributed.parallel_state import get_ep_group
+                raise RuntimeError(
+                    "MoE LoRA with AlltoAll + EP requires exchanged "
+                    "lora indices from the token dispatcher. "
+                    "Ensure split_lora_indices is passed through "
+                    "MoEFusedExpertsInput and MoETokenDispatchInput."
+                )
+            group_list = token_dispatch_output.group_list.to(torch.int64)
+            num_local_experts = lora_context.num_experts
 
-            ep_rank = get_ep_group().rank_in_group
-            local_expert_offset = ep_rank * lora_context.num_experts
-            local_topk_ids = routed_topk_ids - local_expert_offset
-            lora_expert_indices = _build_lora_expert_indices(
-                lora_indices=lora_indices,
-                expanded_row_idx=combine_metadata.reversed_global_input_permutation_mapping,
-                topk_ids=local_topk_ids,
-                num_experts=lora_context.num_experts,
+            # Build per-token expert IDs: [0]*n0 + [1]*n1 + ... + [E-1]*n_{E-1}
+            expert_ids_per_token = torch.repeat_interleave(
+                torch.arange(num_local_experts, device=group_list.device),
+                group_list,
+            )
+            # lora_id * num_experts + local_expert_id
+            lora_expert_indices = (
+                lora_indices.to(torch.int64) * num_local_experts
+                + expert_ids_per_token
+            )
+            # Mark no-LoRA tokens (-1) correctly
+            lora_expert_indices = torch.where(
+                lora_indices >= 0,
+                lora_expert_indices,
+                torch.tensor(-1, dtype=torch.int64, device=lora_expert_indices.device),
             )
         else:
             raise NotImplementedError(
