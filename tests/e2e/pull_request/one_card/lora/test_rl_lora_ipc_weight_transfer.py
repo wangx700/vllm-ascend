@@ -168,7 +168,7 @@ class LoRAIPCWorkerExtension:
         }
 
 
-MODEL_NAME = "/home/w00899129/models_lora/qwen/Qwen/Qwen3-0.6B"
+MODEL_NAME = "Qwen/Qwen3-0.6B"
 ALICE_LORA = "charent/self_cognition_Alice"
 BOB_LORA = "charent/self_cognition_Bob"
 
