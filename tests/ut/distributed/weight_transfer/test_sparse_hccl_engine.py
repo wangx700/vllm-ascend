@@ -61,16 +61,21 @@ def test_update_info_rejects_invalid_metadata(overrides, message):
         make_info(**overrides)
 
 
-def test_start_requires_tp1_pp1():
+def test_start_requires_pp1():
     engine = make_engine()
-    engine.parallel_config = SimpleNamespace(world_size=2)
-    with pytest.raises(NotImplementedError, match="TP=1 and PP=1"):
+    engine.parallel_config = SimpleNamespace(
+        world_size=2, pipeline_parallel_size=2
+    )
+    with pytest.raises(NotImplementedError, match="PP=1"):
         engine.start_weight_update()
 
 
-def test_start_and_finish_are_noops_for_world_size_one():
+@pytest.mark.parametrize("world_size", [1, 4])
+def test_start_and_finish_allow_tp(world_size):
     engine = make_engine()
-    engine.parallel_config = SimpleNamespace(world_size=1)
+    engine.parallel_config = SimpleNamespace(
+        world_size=world_size, pipeline_parallel_size=1
+    )
     engine.start_weight_update()
     engine.finish_weight_update()
 
