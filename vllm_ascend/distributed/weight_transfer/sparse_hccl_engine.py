@@ -24,7 +24,7 @@ from vllm_ascend.distributed.weight_transfer.hccl_engine import (
 )
 from vllm_ascend.distributed.weight_transfer.sparse_weight_patch import (
     SparseWeightPatch,
-    apply_sparse_patch,
+    apply_sparse_hf_patch,
 )
 
 if TYPE_CHECKING:
@@ -104,10 +104,10 @@ class SparseHCCLWeightTransferEngine(
         )
 
     def start_weight_update(self) -> None:
-        """Validate the MVP parallelism restriction before applying patches."""
-        if self.parallel_config.world_size != 1:
+        """Sparse HF patches are applied through the model's TP-aware loader."""
+        if self.parallel_config.pipeline_parallel_size != 1:
             raise NotImplementedError(
-                "Sparse weight updates currently require TP=1 and PP=1"
+                "Sparse HCCL weight updates currently require PP=1"
             )
 
     def finish_weight_update(self) -> None:
@@ -157,10 +157,10 @@ class SparseHCCLWeightTransferEngine(
                 indices=indices,
                 values=values,
             )
-            apply_sparse_patch(
+            apply_sparse_hf_patch(
                 self.model,
                 patch,
-                expected_shape=expected_shape,
+                expected_shape,
             )
             del indices
             del values

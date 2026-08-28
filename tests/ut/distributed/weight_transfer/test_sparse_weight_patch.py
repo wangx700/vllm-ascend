@@ -6,6 +6,7 @@ import torch
 
 from vllm_ascend.distributed.weight_transfer.sparse_weight_patch import (
     SparseWeightPatch,
+    apply_sparse_hf_patch,
     apply_sparse_patch,
 )
 
@@ -129,3 +130,54 @@ def test_apply_sparse_patch_rejects_noncontiguous_parameter():
                 torch.tensor([1.0]),
             ),
         )
+
+
+class DummyTPModel(torch.nn.Module):
+    def __init__(self, rank: int):
+        super().__init__()
+        self.rank = rank
+        self.weight = torch.nn.Parameter(torch.tensor([10.0, 20.0]))
+
+    def load_weights(self, weights):
+        for name, full_weight in weights:
+            self.weight.data.copy_(full_weight[self.rank * 2 : (self.rank + 1) * 2])
+            return {name}
+
+
+class DummyStackedTPModel(DummyTPModel):
+    def load_weights(self, weights):
+        for _, full_weight in weights:
+            self.weight.data.copy_(full_weight[self.rank * 2 : (self.rank + 1) * 2])
+            return {"gate_up_proj.weight"}
+
+
+@pytest.mark.parametrize(
+    ("rank", "expected"),
+    [(0, [10.0, 200.0]), (1, [300.0, 20.0])],
+)
+def test_apply_sparse_hf_patch_uses_tp_loader_and_preserves_untouched(rank, expected):
+    model = DummyTPModel(rank)
+    apply_sparse_hf_patch(
+        model,
+        SparseWeightPatch(
+            "weight",
+            torch.tensor([1, 2], dtype=torch.int32),
+            torch.tensor([200.0, 300.0]),
+        ),
+        [4],
+    )
+    assert torch.equal(model.weight, torch.tensor(expected))
+
+
+def test_apply_sparse_hf_patch_allows_stacked_parameter_name_mapping():
+    model = DummyStackedTPModel(rank=0)
+    apply_sparse_hf_patch(
+        model,
+        SparseWeightPatch(
+            "gate_proj.weight",
+            torch.tensor([1], dtype=torch.int32),
+            torch.tensor([200.0]),
+        ),
+        [4],
+    )
+    assert torch.equal(model.weight, torch.tensor([10.0, 200.0]))

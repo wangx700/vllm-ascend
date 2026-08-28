@@ -364,6 +364,38 @@ class NPUWorker(WorkerBase):
         self.weight_transfer_engine.finish_weight_update()
         self._weight_update_active = False
 
+    def pull_weights(
+        self,
+        local_checkpoint_dir: str,
+        source_dir: str,
+        target_version: int,
+        pre_read_hook: str | None = None,
+    ) -> dict:
+        """Materialize a full or delta checkpoint on this rollout host.
+
+        ``collective_rpc`` invokes this on all NPU workers. The checkpoint
+        helper serializes same-host ranks with a filesystem lock, so each host
+        applies a version exactly once before reload_weights is called.
+        """
+        from vllm.utils.local_checkpoint import pull_checkpoint
+
+        # reload_weights updates model_config.model to the materialized local
+        # checkpoint. Preserve the original model path as the immutable
+        # version-zero seed for retries and restarted training runs.
+        base_dir = getattr(self, "_local_checkpoint_base_dir", None)
+        if base_dir is None:
+            base_dir = self.model_config.model
+            self._local_checkpoint_base_dir = base_dir
+
+        pull_checkpoint(
+            local_checkpoint_dir=local_checkpoint_dir,
+            base_dir=base_dir,
+            source_dir=source_dir,
+            target_version=target_version,
+            pre_read_hook=pre_read_hook,
+        )
+        return {"success": True, "weight_version": str(target_version)}
+
     def shutdown(self) -> None:
         if ensure_kv_transfer_shutdown is not None:
             ensure_kv_transfer_shutdown()

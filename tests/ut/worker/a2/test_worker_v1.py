@@ -1556,6 +1556,29 @@ class TestNPUWorker(TestBase):
                 weights_path="/tmp/weights", is_checkpoint_format=True
             )
 
+    def test_pull_weights_preserves_initial_model_path(self):
+        """The version-zero seed must survive reload_weights path updates."""
+        from vllm_ascend.worker.worker import NPUWorker
+
+        with (
+            patch.object(NPUWorker, "__init__", lambda x, **kwargs: None),
+            patch("vllm.utils.local_checkpoint.pull_checkpoint") as pull_checkpoint,
+        ):
+            worker = NPUWorker()
+            worker.model_config = MagicMock()
+            worker.model_config.model = "/models/base"
+
+            worker.pull_weights("/local/checkpoint", "/shared/weights", 0)
+            worker.model_config.model = "/local/checkpoint"
+            worker.pull_weights("/local/checkpoint", "/shared/weights", 1)
+
+        assert pull_checkpoint.call_count == 2
+        assert [call.kwargs["base_dir"] for call in pull_checkpoint.call_args_list] == [
+            "/models/base",
+            "/models/base",
+        ]
+        assert pull_checkpoint.call_args.kwargs["target_version"] == 1
+
 
 class TestNPUWorkerWeightUpdate(TestBase):
     def _make_worker(self, engine=None):
