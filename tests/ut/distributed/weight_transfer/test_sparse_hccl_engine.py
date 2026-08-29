@@ -97,21 +97,36 @@ def test_trainer_send_rejects_packed():
         SparseHCCLWeightTransferEngine.trainer_send_weights(iter(()), args)
 
 
-def test_trainer_send_broadcasts_indices_then_values():
+def test_trainer_send_packs_indices_and_values_by_dtype():
     group = MagicMock()
     stream = MagicMock()
     args = HCCLTrainerSendWeightsArgs(group=group, stream=stream)
-    patch = SparseWeightPatch(
+    float_patch = SparseWeightPatch(
         "weight",
         torch.tensor([1, 3], dtype=torch.int32),
         torch.tensor([2.0, 4.0]),
     )
+    bf16_patch = SparseWeightPatch(
+        "other_weight",
+        torch.tensor([0], dtype=torch.int32),
+        torch.tensor([5.0], dtype=torch.bfloat16),
+    )
 
-    SparseHCCLWeightTransferEngine.trainer_send_weights(iter([patch]), args)
+    SparseHCCLWeightTransferEngine.trainer_send_weights(
+        iter([float_patch, bf16_patch]), args
+    )
 
+    assert len(group.broadcast.call_args_list) == 3
+    indices, float_values, bf16_values = [
+        broadcast.args[0] for broadcast in group.broadcast.call_args_list
+    ]
+    assert indices.tolist() == [1, 3, 0]
+    assert float_values.tolist() == [2.0, 4.0]
+    assert bf16_values.tolist() == [5.0]
     assert group.broadcast.call_args_list == [
-        call(patch.indices, src=0, stream=stream),
-        call(patch.values, src=0, stream=stream),
+        call(indices, src=0, stream=stream),
+        call(float_values, src=0, stream=stream),
+        call(bf16_values, src=0, stream=stream),
     ]
 
 

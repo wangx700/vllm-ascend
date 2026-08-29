@@ -125,33 +125,63 @@ class SparseHCCLWeightTransferEngine(
                 "Call init_transfer_engine() first."
             )
 
+        total_updates = sum(update_info.num_updates_list)
+        packed_indices = torch.empty(
+            total_updates,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        if packed_indices.numel():
+            self.model_update_group.broadcast(
+                packed_indices,
+                src=0,
+                stream=torch.npu.current_stream(),
+            )
+
+        # Values cannot be concatenated across different dtypes.  Keep one
+        # packed buffer per dtype instead, preserving first-seen dtype order so
+        # trainer and workers issue collectives in exactly the same sequence.
+        dtype_order = list(dict.fromkeys(update_info.dtype_names))
+        packed_values: dict[str, torch.Tensor] = {}
+        for dtype_name in dtype_order:
+            dtype_updates = sum(
+                num_updates
+                for patch_dtype, num_updates in zip(
+                    update_info.dtype_names,
+                    update_info.num_updates_list,
+                    strict=True,
+                )
+                if patch_dtype == dtype_name
+            )
+            values = torch.empty(
+                dtype_updates,
+                dtype=getattr(torch, dtype_name),
+                device=self.device,
+            )
+            if values.numel():
+                self.model_update_group.broadcast(
+                    values,
+                    src=0,
+                    stream=torch.npu.current_stream(),
+                )
+            packed_values[dtype_name] = values
+
+        index_offset = 0
+        value_offsets = dict.fromkeys(dtype_order, 0)
         for name, dtype_name, expected_shape, num_updates in zip(
             update_info.names,
             update_info.dtype_names,
             update_info.shapes,
             update_info.num_updates_list,
+            strict=True,
         ):
-            dtype = getattr(torch, dtype_name)
-            indices = torch.empty(
-                num_updates,
-                dtype=torch.int32,
-                device=self.device,
-            )
-            values = torch.empty(
-                num_updates,
-                dtype=dtype,
-                device=self.device,
-            )
-            self.model_update_group.broadcast(
-                indices,
-                src=0,
-                stream=torch.npu.current_stream(),
-            )
-            self.model_update_group.broadcast(
-                values,
-                src=0,
-                stream=torch.npu.current_stream(),
-            )
+            indices = packed_indices[index_offset : index_offset + num_updates]
+            value_offset = value_offsets[dtype_name]
+            values = packed_values[dtype_name][
+                value_offset : value_offset + num_updates
+            ]
+            index_offset += num_updates
+            value_offsets[dtype_name] = value_offset + num_updates
             patch = SparseWeightPatch(
                 name=name,
                 indices=indices,
@@ -162,8 +192,6 @@ class SparseHCCLWeightTransferEngine(
                 patch,
                 expected_shape,
             )
-            del indices
-            del values
 
     def shutdown(self) -> None:
         if self.model_update_group is not None:
@@ -184,9 +212,24 @@ class SparseHCCLWeightTransferEngine(
                 "Sparse HCCL updates cannot be combined with `packed=True`"
             )
 
+        patches = list(iterator)
+        if not patches:
+            return
+
         stream = args.stream or torch.npu.current_stream()
-        for patch in iterator:
-            args.group.broadcast(patch.indices, src=args.src, stream=stream)
-            args.group.broadcast(patch.values, src=args.src, stream=stream)
+        packed_indices = torch.cat([patch.indices for patch in patches])
+        if packed_indices.numel():
+            args.group.broadcast(packed_indices, src=args.src, stream=stream)
+
+        # One values collective per dtype amortizes HCCL launch latency while
+        # retaining native parameter dtypes and avoiding byte-buffer alignment
+        # constraints.
+        dtype_order = list(dict.fromkeys(patch.values.dtype for patch in patches))
+        for dtype in dtype_order:
+            packed_values = torch.cat(
+                [patch.values for patch in patches if patch.values.dtype == dtype]
+            )
+            if packed_values.numel():
+                args.group.broadcast(packed_values, src=args.src, stream=stream)
 
     trainer_init = staticmethod(trainer_init)
