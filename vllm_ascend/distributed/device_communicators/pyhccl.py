@@ -169,3 +169,39 @@ class PyHcclCommunicator:
             self.comm,
             aclrtStream_t(stream.npu_stream),
         )
+
+    def send(self, tensor: torch.Tensor, dst: int, stream=None) -> None:
+        """Send one contiguous tensor to a communicator rank."""
+        if self.disabled:
+            return
+        assert tensor.device == self.device
+        if not tensor.is_contiguous():
+            raise ValueError("PyHCCL send requires a contiguous tensor")
+        if stream is None:
+            stream = current_stream()
+        self.hccl.hcclSend(
+            buffer_type(tensor.data_ptr()),
+            tensor.numel(),
+            hcclDataTypeEnum.from_torch(tensor.dtype),
+            dst,
+            self.comm,
+            aclrtStream_t(stream.npu_stream),
+        )
+
+    def recv(self, tensor: torch.Tensor, src: int, stream=None) -> None:
+        """Receive one contiguous tensor from a communicator rank."""
+        if self.disabled:
+            return
+        assert tensor.device == self.device
+        if not tensor.is_contiguous():
+            raise ValueError("PyHCCL recv requires a contiguous tensor")
+        if stream is None:
+            stream = current_stream()
+        self.hccl.hcclRecv(
+            buffer_type(tensor.data_ptr()),
+            tensor.numel(),
+            hcclDataTypeEnum.from_torch(tensor.dtype),
+            src,
+            self.comm,
+            aclrtStream_t(stream.npu_stream),
+        )

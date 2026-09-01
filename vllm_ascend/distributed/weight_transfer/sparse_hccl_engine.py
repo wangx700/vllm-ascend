@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
-
 from vllm.config.weight_transfer import WeightTransferConfig
 from vllm.distributed.weight_transfer.base import (
     WeightTransferEngine,
@@ -23,8 +22,9 @@ from vllm_ascend.distributed.weight_transfer.hccl_engine import (
     HCCLTrainerSendWeightsArgs,
 )
 from vllm_ascend.distributed.weight_transfer.sparse_weight_patch import (
+    SparseLoadPlanCache,
     SparseWeightPatch,
-    apply_sparse_hf_patch,
+    apply_sparse_hf_patches,
 )
 
 if TYPE_CHECKING:
@@ -36,9 +36,18 @@ if TYPE_CHECKING:
 
 __all__ = [
     "SparseWeightPatch",
+    "SparseHCCLTrainerSendWeightsArgs",
     "SparseHCCLWeightTransferUpdateInfo",
     "SparseHCCLWeightTransferEngine",
 ]
+
+
+@dataclass
+class SparseHCCLTrainerSendWeightsArgs(HCCLTrainerSendWeightsArgs):
+    """Sparse HCCL arguments with optional worker-specific payloads."""
+
+    rank_patches: list[list[SparseWeightPatch]] | None = None
+    """Patches for communicator ranks 1..N, already filtered by rollout TP."""
 
 
 @dataclass
@@ -50,6 +59,8 @@ class SparseHCCLWeightTransferUpdateInfo(WeightTransferUpdateInfo):
     shapes: list[list[int]]
     num_updates_list: list[int]
     """Number of sparse entries to receive for each parameter in ``names``."""
+    rank_num_updates_lists: list[list[int]] | None = None
+    """Per-worker counts for rank-specific P2P; rows represent ranks 1..N."""
 
     def __post_init__(self) -> None:
         num_params = len(self.names)
@@ -72,6 +83,17 @@ class SparseHCCLWeightTransferUpdateInfo(WeightTransferUpdateInfo):
             )
         if any(num_updates < 0 for num_updates in self.num_updates_list):
             raise ValueError("Sparse `num_updates_list` entries must be non-negative")
+        if self.rank_num_updates_lists is not None:
+            if any(len(counts) != num_params for counts in self.rank_num_updates_lists):
+                raise ValueError(
+                    "Each `rank_num_updates_lists` row must match `names`"
+                )
+            if any(
+                count < 0
+                for counts in self.rank_num_updates_lists
+                for count in counts
+            ):
+                raise ValueError("Rank-specific sparse counts must be non-negative")
 
 
 class SparseHCCLWeightTransferEngine(
@@ -95,6 +117,7 @@ class SparseHCCLWeightTransferEngine(
     ) -> None:
         super().__init__(config, vllm_config, device, model)
         self.model_update_group: PyHcclCommunicator | None = None
+        self._load_plan_cache: SparseLoadPlanCache = {}
 
     def init_transfer_engine(self, init_info: HCCLWeightTransferInitInfo) -> None:
         """Initialize the HCCL process group with the trainer."""
@@ -125,18 +148,32 @@ class SparseHCCLWeightTransferEngine(
                 "Call init_transfer_engine() first."
             )
 
-        total_updates = sum(update_info.num_updates_list)
+        num_updates_list = update_info.num_updates_list
+        rank_partitioned = update_info.rank_num_updates_lists is not None
+        if rank_partitioned:
+            worker_index = self.model_update_group.rank - 1
+            if worker_index < 0 or worker_index >= len(
+                update_info.rank_num_updates_lists
+            ):
+                raise ValueError(
+                    "Sparse rank-specific metadata does not include "
+                    f"communicator rank {self.model_update_group.rank}"
+                )
+            num_updates_list = update_info.rank_num_updates_lists[worker_index]
+
+        total_updates = sum(num_updates_list)
         packed_indices = torch.empty(
             total_updates,
             dtype=torch.int32,
             device=self.device,
         )
         if packed_indices.numel():
-            self.model_update_group.broadcast(
-                packed_indices,
-                src=0,
-                stream=torch.npu.current_stream(),
+            transfer = (
+                self.model_update_group.recv
+                if rank_partitioned
+                else self.model_update_group.broadcast
             )
+            transfer(packed_indices, src=0, stream=torch.npu.current_stream())
 
         # Values cannot be concatenated across different dtypes.  Keep one
         # packed buffer per dtype instead, preserving first-seen dtype order so
@@ -148,7 +185,7 @@ class SparseHCCLWeightTransferEngine(
                 num_updates
                 for patch_dtype, num_updates in zip(
                     update_info.dtype_names,
-                    update_info.num_updates_list,
+                    num_updates_list,
                     strict=True,
                 )
                 if patch_dtype == dtype_name
@@ -159,20 +196,22 @@ class SparseHCCLWeightTransferEngine(
                 device=self.device,
             )
             if values.numel():
-                self.model_update_group.broadcast(
-                    values,
-                    src=0,
-                    stream=torch.npu.current_stream(),
+                transfer = (
+                    self.model_update_group.recv
+                    if rank_partitioned
+                    else self.model_update_group.broadcast
                 )
+                transfer(values, src=0, stream=torch.npu.current_stream())
             packed_values[dtype_name] = values
 
         index_offset = 0
         value_offsets = dict.fromkeys(dtype_order, 0)
+        patches: list[tuple[SparseWeightPatch, list[int]]] = []
         for name, dtype_name, expected_shape, num_updates in zip(
             update_info.names,
             update_info.dtype_names,
             update_info.shapes,
-            update_info.num_updates_list,
+            num_updates_list,
             strict=True,
         ):
             indices = packed_indices[index_offset : index_offset + num_updates]
@@ -182,18 +221,22 @@ class SparseHCCLWeightTransferEngine(
             ]
             index_offset += num_updates
             value_offsets[dtype_name] = value_offset + num_updates
-            patch = SparseWeightPatch(
-                name=name,
-                indices=indices,
-                values=values,
+            patches.append(
+                (
+                    SparseWeightPatch(
+                        name=name,
+                        indices=indices,
+                        values=values,
+                    ),
+                    expected_shape,
+                )
             )
-            apply_sparse_hf_patch(
-                self.model,
-                patch,
-                expected_shape,
-            )
+        apply_sparse_hf_patches(
+            self.model, patches, plan_cache=self._load_plan_cache
+        )
 
     def shutdown(self) -> None:
+        self._load_plan_cache.clear()
         if self.model_update_group is not None:
             self.model_update_group = None
 
@@ -204,7 +247,7 @@ class SparseHCCLWeightTransferEngine(
     ) -> None:
         """Broadcast sparse flat-index patches from trainer to workers."""
         if isinstance(trainer_args, dict):
-            args = HCCLTrainerSendWeightsArgs(**trainer_args)
+            args = SparseHCCLTrainerSendWeightsArgs(**trainer_args)
         else:
             args = trainer_args
         if args.packed:
@@ -217,6 +260,12 @@ class SparseHCCLWeightTransferEngine(
             return
 
         stream = args.stream or torch.npu.current_stream()
+        rank_patches = getattr(args, "rank_patches", None)
+        if rank_patches is not None:
+            SparseHCCLWeightTransferEngine._send_rank_patches(
+                rank_patches, args, stream
+            )
+            return
         packed_indices = torch.cat([patch.indices for patch in patches])
         if packed_indices.numel():
             args.group.broadcast(packed_indices, src=args.src, stream=stream)
@@ -231,5 +280,33 @@ class SparseHCCLWeightTransferEngine(
             )
             if packed_values.numel():
                 args.group.broadcast(packed_values, src=args.src, stream=stream)
+
+    @staticmethod
+    def _send_rank_patches(
+        rank_patches: list[list[SparseWeightPatch]],
+        args: HCCLTrainerSendWeightsArgs,
+        stream: torch.npu.Stream,
+    ) -> None:
+        if len(rank_patches) != args.group.world_size - 1:
+            raise ValueError(
+                "`rank_patches` must contain one row per non-trainer rank"
+            )
+        for dst, patches in enumerate(rank_patches, start=1):
+            packed_indices = torch.cat([patch.indices for patch in patches])
+            if packed_indices.numel():
+                args.group.send(packed_indices, dst=dst, stream=stream)
+            dtype_order = list(
+                dict.fromkeys(patch.values.dtype for patch in patches)
+            )
+            for dtype in dtype_order:
+                packed_values = torch.cat(
+                    [
+                        patch.values
+                        for patch in patches
+                        if patch.values.dtype == dtype
+                    ]
+                )
+                if packed_values.numel():
+                    args.group.send(packed_values, dst=dst, stream=stream)
 
     trainer_init = staticmethod(trainer_init)

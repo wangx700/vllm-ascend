@@ -11,6 +11,7 @@ from vllm_ascend.distributed.weight_transfer.hccl_engine import (
     HCCLTrainerSendWeightsArgs,
 )
 from vllm_ascend.distributed.weight_transfer.sparse_hccl_engine import (
+    SparseHCCLTrainerSendWeightsArgs,
     SparseHCCLWeightTransferEngine,
     SparseHCCLWeightTransferUpdateInfo,
     SparseWeightPatch,
@@ -39,6 +40,7 @@ def make_info(**overrides):
 def make_engine(model=None):
     engine = object.__new__(SparseHCCLWeightTransferEngine)
     engine.model = model or DummyModel()
+    engine._load_plan_cache = {}
     return engine
 
 
@@ -127,6 +129,47 @@ def test_trainer_send_packs_indices_and_values_by_dtype():
         call(indices, src=0, stream=stream),
         call(float_values, src=0, stream=stream),
         call(bf16_values, src=0, stream=stream),
+    ]
+
+
+def test_trainer_send_uses_rank_specific_p2p_payloads():
+    group = MagicMock(world_size=3)
+    stream = MagicMock()
+    global_patch = SparseWeightPatch(
+        "weight",
+        torch.tensor([0, 1], dtype=torch.int32),
+        torch.tensor([10.0, 11.0]),
+    )
+    rank_patches = [
+        [
+            SparseWeightPatch(
+                "weight",
+                torch.tensor([0], dtype=torch.int32),
+                torch.tensor([10.0]),
+            )
+        ],
+        [
+            SparseWeightPatch(
+                "weight",
+                torch.tensor([1], dtype=torch.int32),
+                torch.tensor([11.0]),
+            )
+        ],
+    ]
+
+    SparseHCCLWeightTransferEngine.trainer_send_weights(
+        iter([global_patch]),
+        SparseHCCLTrainerSendWeightsArgs(
+            group=group, stream=stream, rank_patches=rank_patches
+        ),
+    )
+
+    assert group.broadcast.call_count == 0
+    assert [item.kwargs["dst"] for item in group.send.call_args_list] == [
+        1,
+        1,
+        2,
+        2,
     ]
 
 

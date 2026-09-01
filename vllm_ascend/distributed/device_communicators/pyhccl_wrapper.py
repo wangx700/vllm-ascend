@@ -162,6 +162,36 @@ class HCCLLibrary:
                 aclrtStream_t,
             ],
         ),
+        # HcclResult HcclSend(
+        #   void *sendBuf, uint64_t count, HcclDataType dataType,
+        #   uint32_t destRank, HcclComm comm, aclrtStream stream);
+        Function(
+            "HcclSend",
+            hcclResult_t,
+            [
+                buffer_type,
+                ctypes.c_size_t,
+                hcclDataType_t,
+                ctypes.c_int,
+                hcclComm_t,
+                aclrtStream_t,
+            ],
+        ),
+        # HcclResult HcclRecv(
+        #   void *recvBuf, uint64_t count, HcclDataType dataType,
+        #   uint32_t srcRank, HcclComm comm, aclrtStream stream);
+        Function(
+            "HcclRecv",
+            hcclResult_t,
+            [
+                buffer_type,
+                ctypes.c_size_t,
+                hcclDataType_t,
+                ctypes.c_int,
+                hcclComm_t,
+                aclrtStream_t,
+            ],
+        ),
         # HcclResult HcclCommDestroy(HcclComm comm);
         Function("HcclCommDestroy", hcclResult_t, [hcclComm_t]),
     ]
@@ -200,7 +230,13 @@ class HCCLLibrary:
         if so_file not in HCCLLibrary.path_to_dict_mapping:
             _funcs: dict[str, Any] = {}
             for func in HCCLLibrary.exported_functions:
-                f = getattr(self.lib, func.name)
+                f = getattr(self.lib, func.name, None)
+                if f is None and func.name in {"HcclSend", "HcclRecv"}:
+                    continue
+                if f is None:
+                    raise AttributeError(
+                        f"HCCL library does not export {func.name}"
+                    )
                 f.restype = func.restype
                 f.argtypes = func.argtypes
                 _funcs[func.name] = f
@@ -248,6 +284,40 @@ class HCCLLibrary:
         self, buf: buffer_type, count: int, datatype: int, root: int, comm: hcclComm_t, stream: aclrtStream_t
     ) -> None:
         self.HCCL_CHECK(self._funcs["HcclBroadcast"](buf, count, datatype, root, comm, stream))
+
+    def hcclSend(
+        self,
+        buf: buffer_type,
+        count: int,
+        datatype: int,
+        dest_rank: int,
+        comm: hcclComm_t,
+        stream: aclrtStream_t,
+    ) -> None:
+        if "HcclSend" not in self._funcs:
+            raise NotImplementedError("The installed HCCL does not support P2P send")
+        self.HCCL_CHECK(
+            self._funcs["HcclSend"](
+                buf, count, datatype, dest_rank, comm, stream
+            )
+        )
+
+    def hcclRecv(
+        self,
+        buf: buffer_type,
+        count: int,
+        datatype: int,
+        src_rank: int,
+        comm: hcclComm_t,
+        stream: aclrtStream_t,
+    ) -> None:
+        if "HcclRecv" not in self._funcs:
+            raise NotImplementedError("The installed HCCL does not support P2P recv")
+        self.HCCL_CHECK(
+            self._funcs["HcclRecv"](
+                buf, count, datatype, src_rank, comm, stream
+            )
+        )
 
     def hcclCommDestroy(self, comm: hcclComm_t) -> None:
         self.HCCL_CHECK(self._funcs["HcclCommDestroy"](comm))

@@ -187,10 +187,8 @@ def test_sparse_hccl_weight_transfer_updates_server_weights():
         tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
         patch, parameter = _build_sparse_patch(train_model, tokenizer)
 
-        from vllm_ascend.distributed.weight_transfer.hccl_engine import (
-            HCCLTrainerSendWeightsArgs,
-        )
         from vllm_ascend.distributed.weight_transfer.sparse_hccl_engine import (
+            SparseHCCLTrainerSendWeightsArgs,
             SparseHCCLWeightTransferEngine,
         )
 
@@ -227,6 +225,7 @@ def test_sparse_hccl_weight_transfer_updates_server_weights():
             "dtype_names": [str(patch.values.dtype).split(".")[-1]],
             "shapes": [list(parameter.shape)],
             "num_updates_list": [patch.indices.numel()],
+            "rank_num_updates_lists": [[patch.indices.numel()]],
         }
         update_thread = _BackgroundPost(
             server,
@@ -237,7 +236,9 @@ def test_sparse_hccl_weight_transfer_updates_server_weights():
         update_thread.start()
         SparseHCCLWeightTransferEngine.trainer_send_weights(
             iter([patch]),
-            HCCLTrainerSendWeightsArgs(group=group),
+            SparseHCCLTrainerSendWeightsArgs(
+                group=group, rank_patches=[[patch]]
+            ),
         )
         torch.npu.synchronize()
         update_thread.join()
